@@ -19,8 +19,8 @@ typedef uint16_t port_t;
 
 #define SINGLE_INSTANCE_PORT 48101
 
-#define FAKE_CNC_ADDR   INET_ADDR(82,29,126,95)
-#define FAKE_CNC_PORT   80
+#define FAKE_CNC_ADDR   INET_ADDR(127,0,0,1)
+#define FAKE_CNC_PORT   23
 
 #define CNC_OP_PING         0x00
 #define CNC_OP_KILLSELF     0x10
