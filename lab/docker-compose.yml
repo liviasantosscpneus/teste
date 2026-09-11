@@ -1,1 +1,22 @@
+version: "3.9"
+services:
+  victim-2324:
+    build: .
+    container_name: mirai-victim-2324
+    ports:
+      - "2324:23"
+    command: ["python3", "/fake_telnetd.py", "23"]
 
+  victim-2325:
+    build: .
+    container_name: mirai-victim-2325
+    ports:
+      - "2325:23"
+    command: ["python3", "/fake_telnetd.py", "23"]
+
+  victim-2326:
+    build: .
+    container_name: mirai-victim-2326
+    ports:
+      - "2326:23"
+    command: ["python3", "/fake_telnetd.py", "23"]
